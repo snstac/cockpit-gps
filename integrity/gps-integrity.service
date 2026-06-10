@@ -6,7 +6,7 @@ Wants=gpsd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/gps-integrity
+ExecStart=/usr/bin/gps-integrity
 Restart=always
 RestartSec=5
 DynamicUser=yes

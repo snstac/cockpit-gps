@@ -83,14 +83,14 @@ uninstall:
 
 # Optional spoof/jam integrity monitor (systemd service).
 install-integrity:
-	install -D -m 0755 integrity/gps-integrity $(DESTDIR)/usr/local/bin/gps-integrity
+	install -D -m 0755 integrity/gps-integrity $(DESTDIR)/usr/bin/gps-integrity
 	install -D -m 0644 integrity/gps-integrity.service $(DESTDIR)/etc/systemd/system/gps-integrity.service
 	install -D -m 0644 integrity/gps-integrity.conf.example $(DESTDIR)/etc/gps-integrity.conf.example
 	@echo "Installed integrity monitor. Enable with: systemctl enable --now gps-integrity.service"
 
 uninstall-integrity:
 	-systemctl disable --now gps-integrity.service 2>/dev/null || true
-	rm -f $(DESTDIR)/usr/local/bin/gps-integrity $(DESTDIR)/etc/systemd/system/gps-integrity.service
+	rm -f $(DESTDIR)/usr/bin/gps-integrity $(DESTDIR)/etc/systemd/system/gps-integrity.service
 
 # Development: symlink the built tree into the per-user cockpit dir (no root).
 devel-install: $(DIST_TEST)

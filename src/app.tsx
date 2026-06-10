@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: LGPL-2.1-or-later
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Cockpit GPS — live GNSS readout sourced from gpsd via `gpspipe -w`.
  */

@@ -37,3 +37,6 @@
 /test/images/
 /test/static-code
 /*.tar.gz
+/out/
+*.deb
+*.rpm

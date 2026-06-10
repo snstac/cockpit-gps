@@ -2,7 +2,7 @@
 <component type="addon">
   <id>org.snstac.gps</id>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>LGPL-2.1-or-later</project_license>
+  <project_license>Apache-2.0</project_license>
   <name>GPS</name>
   <summary>Live GNSS position, satellites, and spoof/jam integrity from gpsd</summary>
   <description>

@@ -1,0 +1,49 @@
+# nfpm config — builds both .deb and .rpm from the prebuilt dist/ tree.
+# Usage: VERSION=1.2.3 nfpm package -f nfpm.yaml -p deb -t out/
+#        VERSION=1.2.3 nfpm package -f nfpm.yaml -p rpm -t out/
+name: cockpit-gps
+arch: all
+platform: linux
+version: ${VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: "Sensors & Signals LLC <oss@snstac.com>"
+vendor: "Sensors & Signals LLC"
+homepage: https://github.com/snstac/cockpit-gps
+license: Apache-2.0
+description: |
+  Live GNSS data and spoof/jam integrity for the Cockpit web console.
+  Shows position, motion, fix quality, and a per-satellite signal table from
+  gpsd, plus an optional GPS spoof/jam integrity monitor service.
+
+depends:
+  - cockpit-bridge
+  - gpsd-clients
+recommends:
+  - gpsd
+  - python3
+
+contents:
+  # Cockpit plugin (prebuilt, gzipped)
+  - src: ./dist/
+    dst: /usr/share/cockpit/gps
+    type: tree
+
+  # AppStream metainfo
+  - src: ./org.snstac.gps.metainfo.xml
+    dst: /usr/share/metainfo/org.snstac.gps.metainfo.xml
+
+  # Integrity monitor (optional service; not auto-enabled)
+  - src: ./integrity/gps-integrity
+    dst: /usr/bin/gps-integrity
+    file_info:
+      mode: 0755
+  - src: ./integrity/gps-integrity.service
+    dst: /usr/lib/systemd/system/gps-integrity.service
+  - src: ./integrity/gps-integrity.conf.example
+    dst: /usr/share/doc/cockpit-gps/gps-integrity.conf.example
+
+scripts:
+  postinstall: ./packaging/postinstall.sh
+  preremove: ./packaging/preremove.sh

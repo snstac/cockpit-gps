@@ -115,4 +115,4 @@ position and time can defeat heuristic detection.
 
 ## License
 
-LGPL-2.1-or-later. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).
