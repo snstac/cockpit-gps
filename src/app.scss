@@ -1,0 +1,86 @@
+@use "page.scss";
+
+// Cockpit sets `body { overflow-block: hidden }` and expects each plugin to
+// provide its own scroll container. Make the page fill the viewport height and
+// scroll internally, otherwise content taller than the frame is clipped with
+// no way to scroll.
+html,
+body,
+#app {
+    block-size: 100%;
+}
+
+.gps-page {
+    block-size: 100%;
+    overflow-y: auto;
+    padding: var(--pf-t--global--spacer--lg, 1rem);
+}
+
+// Muted secondary line under a primary value (e.g. DMS under decimal degrees).
+.gps-sub {
+    color: var(--pf-t--global--text--color--subtle, #6a6e73);
+    font-size: var(--pf-t--global--font--size--sm, 0.875rem);
+}
+
+// Satellite table
+.gps-sat-table {
+    inline-size: 100%;
+    border-collapse: collapse;
+    font-size: var(--pf-t--global--font--size--sm, 0.875rem);
+
+    th,
+    td {
+        text-align: start;
+        padding: 4px 12px 4px 0;
+        border-block-end: 1px solid var(--pf-t--global--border--color--default, #d2d2d2);
+        white-space: nowrap;
+    }
+
+    th {
+        color: var(--pf-t--global--text--color--subtle, #6a6e73);
+        font-weight: var(--pf-t--global--font--weight--body--bold, 700);
+    }
+
+    .gps-sat-used td {
+        font-weight: var(--pf-t--global--font--weight--body--bold, 700);
+    }
+}
+
+// Integrity check rows
+.gps-integrity-table {
+    inline-size: 100%;
+    border-collapse: collapse;
+    margin-block-start: var(--pf-t--global--spacer--sm, 0.5rem);
+
+    td {
+        padding: 4px 12px 4px 0;
+        vertical-align: middle;
+        white-space: nowrap;
+    }
+
+    td:last-child {
+        inline-size: 100%;
+        white-space: normal;
+    }
+}
+
+// Inline SNR strength bar
+.gps-snr {
+    position: relative;
+    display: flex;
+    align-items: center;
+    min-inline-size: 90px;
+    gap: 8px;
+
+    .gps-snr-bar {
+        display: inline-block;
+        block-size: 8px;
+        min-inline-size: 2px;
+        background: var(--pf-t--global--color--brand--default, #0066cc);
+        border-radius: 2px;
+    }
+
+    .gps-snr-val {
+        color: var(--pf-t--global--text--color--subtle, #6a6e73);
+    }
+}

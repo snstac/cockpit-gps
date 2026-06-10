@@ -1,0 +1,17 @@
+{
+    "requires": {
+        "cockpit": "320"
+    },
+
+    "menu": {
+        "index": {
+            "label": "GPS",
+            "order": 100,
+            "keywords": [
+                {
+                    "matches": ["gps", "gnss", "gpsd", "location", "position", "satellite", "navigation", "nmea"]
+                }
+            ]
+        }
+    }
+}

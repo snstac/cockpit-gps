@@ -1,0 +1,28 @@
+[Unit]
+Description=GPS integrity (spoof/jam) heuristic monitor
+Documentation=man:gpsd(8)
+After=gpsd.service
+Wants=gpsd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/gps-integrity
+Restart=always
+RestartSec=5
+DynamicUser=yes
+RuntimeDirectory=gps-integrity
+RuntimeDirectoryMode=0755
+StateDirectory=gps-integrity
+StateDirectoryMode=0755
+# hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+
+[Install]
+WantedBy=multi-user.target

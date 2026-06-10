@@ -1,0 +1,28 @@
+{
+  "_comment": "Optional config for the gps-integrity monitor. Copy to /etc/gps-integrity.conf and edit. All keys are optional; omitted keys use built-in defaults. Remove the _comment key (JSON has no comments).",
+
+  "stationary": true,
+
+  "survey_samples": 90,
+  "persist_s": 5,
+
+  "pos_warn_m": 15.0,
+  "pos_crit_m": 50.0,
+
+  "time_warn_s": 1.0,
+  "time_crit_s": 3.0,
+
+  "vel_warn_ms": 1.5,
+  "vel_crit_ms": 5.0,
+
+  "cn0_uniform_spread": 8.0,
+  "cn0_uniform_mean": 45.0,
+  "cn0_uniform_minsats": 6,
+  "cn0_drop_db": 10.0,
+  "min_sats": 4,
+
+  "_reference_note": "Leave ref_lat/ref_lon/ref_alt null to auto survey-in. Set them to pin a known surveyed position and skip the survey.",
+  "ref_lat": null,
+  "ref_lon": null,
+  "ref_alt": null
+}

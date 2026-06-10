@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# gps-integrity — heuristic GPS spoof/jam monitor for a (stationary) gpsd feed.
+#
+# The ZED-F9P on this box is reachable read-only over NMEA, so its native UBX
+# anti-spoof/jam telemetry (NAV-STATUS spoofDetState, SEC-SIG, MON-RF AGC) is
+# unavailable. Instead we derive integrity from the NMEA-sourced gpsd JSON plus
+# two out-of-band facts that are hard to spoof together:
+#   * the receiver is a surveyed fixed base  -> any real position move is suspect
+#   * the system clock is NTP-disciplined    -> GPS time can be cross-checked
+#
+# Output: /run/gps-integrity/status.json (one object, rewritten ~1/s) and
+# WARN/CRIT transitions logged to stdout (captured by the journal).
+
+import json
+import math
+import os
+import socket
+import statistics
+import sys
+import time
+from collections import deque
+from datetime import datetime, timezone
+
+CONF_PATH = "/etc/gps-integrity.conf"
+STATE_DIR = os.environ.get("STATE_DIRECTORY", "/var/lib/gps-integrity")
+RUNTIME_DIR = os.environ.get("RUNTIME_DIRECTORY", "/run/gps-integrity")
+REF_PATH = os.path.join(STATE_DIR, "reference.json")
+STATUS_PATH = os.path.join(RUNTIME_DIR, "status.json")
+
+# ---- defaults (overridable via /etc/gps-integrity.conf, JSON) ----
+DEFAULTS = {
+    "gpsd_host": "127.0.0.1",
+    "gpsd_port": 2947,
+    "stationary": True,            # treat as a fixed base
+    "survey_samples": 90,          # good fixes to average for the reference
+    "persist_s": 5,                # an anomaly must hold this long to escalate
+    # position deviation from reference (metres)
+    "pos_warn_m": 15.0,
+    "pos_crit_m": 50.0,
+    # GPS-vs-system(NTP) time delta (seconds, absolute)
+    "time_warn_s": 1.0,
+    "time_crit_s": 3.0,
+    # speed while stationary (m/s)
+    "vel_warn_ms": 1.5,
+    "vel_crit_ms": 5.0,
+    # spoof signature: many sats all at uniformly high C/N0
+    "cn0_uniform_spread": 8.0,     # dB-Hz, max-min below this is suspicious...
+    "cn0_uniform_mean": 45.0,      # ...combined with mean above this...
+    "cn0_uniform_minsats": 6,      # ...across at least this many signals
+    # jamming signature: collective C/N0 drop vs rolling baseline
+    "cn0_drop_db": 10.0,
+    "min_sats": 4,
+    # reference override (skip survey) — set lat/lon/alt to use directly
+    "ref_lat": None,
+    "ref_lon": None,
+    "ref_alt": None,
+}
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    try:
+        with open(CONF_PATH) as f:
+            conf.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"WARN config {CONF_PATH} ignored: {e}")
+    return conf
+
+
+def log(msg):
+    print(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {msg}", flush=True)
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+GNSS = {0: "GPS", 1: "SBAS", 2: "GAL", 3: "BDS", 4: "IMES", 5: "QZSS", 6: "GLO", 7: "NavIC"}
+
+
+class GpsdStream:
+    """Line-reader for the gpsd JSON protocol with auto-reconnect."""
+
+    def __init__(self, host, port):
+        self.host, self.port = host, port
+        self.sock = None
+        self.buf = b""
+
+    def _connect(self):
+        self.sock = socket.create_connection((self.host, self.port), timeout=10)
+        self.sock.sendall(b'?WATCH={"enable":true,"json":true}\n')
+        self.buf = b""
+
+    def messages(self):
+        while True:
+            if self.sock is None:
+                try:
+                    self._connect()
+                except OSError as e:
+                    log(f"WARN gpsd connect failed: {e}; retrying")
+                    time.sleep(3)
+                    continue
+            try:
+                chunk = self.sock.recv(8192)
+                if not chunk:
+                    raise OSError("gpsd closed connection")
+                self.buf += chunk
+            except OSError as e:
+                log(f"WARN gpsd read error: {e}; reconnecting")
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+                continue
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    continue
+
+
+class Monitor:
+    def __init__(self, conf):
+        self.conf = conf
+        self.ref = None              # {lat,lon,alt}
+        self.ref_mode = "surveying"
+        self.survey = []             # list of (lat,lon,alt) during survey-in
+        self.cn0_hist = deque(maxlen=600)   # rolling median-C/N0 baseline (~10 min)
+        self.const_baseline = set()
+        self.bad_since = {}          # check -> ts when it first went non-ok
+        self.overall = "init"
+        self.start = time.monotonic()
+        self.last_time_delta = None  # GPS-vs-system delta, sampled when TPV arrives
+        self.load_reference()
+
+    # ----- reference position (survey-in or configured) -----
+    def load_reference(self):
+        c = self.conf
+        if c["ref_lat"] is not None and c["ref_lon"] is not None:
+            self.ref = {"lat": c["ref_lat"], "lon": c["ref_lon"], "alt": c.get("ref_alt")}
+            self.ref_mode = "configured"
+            log(f"INFO using configured reference {self.ref}")
+            return
+        try:
+            with open(REF_PATH) as f:
+                self.ref = json.load(f)
+            self.ref_mode = "surveyed"
+            log(f"INFO loaded surveyed reference {self.ref}")
+        except FileNotFoundError:
+            log("INFO no reference yet — surveying in")
+
+    def save_reference(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = REF_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.ref, f)
+        os.replace(tmp, REF_PATH)
+
+    def survey_in(self, tpv):
+        if tpv.get("mode") != 3 or tpv.get("lat") is None:
+            return
+        self.survey.append((tpv["lat"], tpv["lon"], tpv.get("altMSL")))
+        if len(self.survey) >= self.conf["survey_samples"]:
+            lats = [s[0] for s in self.survey]
+            lons = [s[1] for s in self.survey]
+            alts = [s[2] for s in self.survey if s[2] is not None]
+            self.ref = {
+                "lat": statistics.fmean(lats),
+                "lon": statistics.fmean(lons),
+                "alt": statistics.fmean(alts) if alts else None,
+            }
+            self.ref_mode = "surveyed"
+            self.save_reference()
+            log(f"INFO survey-in complete over {len(self.survey)} fixes: {self.ref}")
+
+    # ----- individual checks: return (severity, detail, extra dict) -----
+    def check_position(self, tpv):
+        if self.ref is None:
+            return ("ok", f"surveying ({len(self.survey)}/{self.conf['survey_samples']})", {"surveying": True})
+        if tpv.get("lat") is None:
+            return ("ok", "no fix", {})
+        d = haversine_m(self.ref["lat"], self.ref["lon"], tpv["lat"], tpv["lon"])
+        sev = "crit" if d > self.conf["pos_crit_m"] else "warn" if d > self.conf["pos_warn_m"] else "ok"
+        return (sev, f"{d:.2f} m off reference", {"offset_m": round(d, 2)})
+
+    @staticmethod
+    def parse_gps_epoch(t):
+        try:
+            return datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+        except (ValueError, AttributeError):
+            return None
+
+    def check_time(self, tpv):
+        delta = self.last_time_delta    # sampled at TPV arrival, not at tick time
+        if delta is None:
+            return ("ok", "no time", {})
+        ad = abs(delta)
+        sev = "crit" if ad > self.conf["time_crit_s"] else "warn" if ad > self.conf["time_warn_s"] else "ok"
+        return (sev, f"{delta * 1000:+.0f} ms vs system/NTP", {"delta_ms": round(delta * 1000)})
+
+    def check_velocity(self, tpv):
+        if not self.conf["stationary"] or tpv.get("speed") is None:
+            return ("ok", "n/a", {})
+        v = tpv["speed"]
+        sev = "crit" if v > self.conf["vel_crit_ms"] else "warn" if v > self.conf["vel_warn_ms"] else "ok"
+        return (sev, f"{v:.2f} m/s", {"speed_ms": round(v, 2)})
+
+    def check_cn0(self, sky):
+        sats = [s for s in (sky.get("satellites") or []) if (s.get("ss") or 0) > 0]
+        if len(sats) < self.conf["cn0_uniform_minsats"]:
+            return ("ok", f"{len(sats)} signals", {"nsig": len(sats)})
+        ss = [s["ss"] for s in sats]
+        spread = max(ss) - min(ss)
+        mean = statistics.fmean(ss)
+        uniform = (spread < self.conf["cn0_uniform_spread"] and mean > self.conf["cn0_uniform_mean"])
+        sev = "warn" if uniform else "ok"
+        detail = f"spread {spread:.0f} dB-Hz, mean {mean:.0f}"
+        if uniform:
+            detail += " (uniform/high — possible spoof)"
+        return (sev, detail, {"spread": round(spread, 1), "mean": round(mean, 1), "nsig": len(sats)})
+
+    def check_jamming(self, tpv, sky):
+        sats = [s for s in (sky.get("satellites") or []) if (s.get("ss") or 0) > 0]
+        mode = tpv.get("mode", 0)
+        if not sats:
+            # No signals at all while we expect a fix is a strong jamming sign.
+            if self.cn0_hist:
+                return ("crit", "no satellite signals", {"sats": 0, "median": None, "mode": mode})
+            return ("ok", "acquiring", {"sats": 0})
+        med = statistics.median([s["ss"] for s in sats])
+        self.cn0_hist.append(med)
+        baseline = statistics.median(self.cn0_hist) if len(self.cn0_hist) >= 30 else med
+        drop = baseline - med
+        lost = mode < 2 and len(self.cn0_hist) >= 30
+        few = len(sats) < self.conf["min_sats"]
+        if lost or (drop >= self.conf["cn0_drop_db"] and few):
+            sev = "crit" if lost else "warn"
+        elif drop >= self.conf["cn0_drop_db"] or few:
+            sev = "warn"
+        else:
+            sev = "ok"
+        detail = f"{len(sats)} sats, median {med:.0f} dB-Hz (base {baseline:.0f})"
+        return (sev, detail, {"sats": len(sats), "median": round(med, 1),
+                              "baseline": round(baseline, 1), "mode": mode})
+
+    def check_constellations(self, sky):
+        systems = sorted({GNSS.get(s.get("gnssid"), "?")
+                          for s in (sky.get("satellites") or []) if (s.get("ss") or 0) > 0})
+        systems = [s for s in systems if s not in ("?", "SBAS")]
+        self.const_baseline |= set(systems)
+        n_base = len(self.const_baseline)
+        sev = "ok"
+        # Going from a healthy multi-GNSS sky down to GPS-only can indicate a
+        # GPS-L1-only spoofer overpowering the real signal.
+        if n_base >= 3 and len(systems) <= 1:
+            sev = "warn"
+        detail = " ".join(systems) if systems else "none"
+        return (sev, detail, {"systems": systems})
+
+    # ----- persistence + overall verdict -----
+    SEV_RANK = {"ok": 0, "warn": 1, "crit": 2}
+
+    def apply_persistence(self, name, sev):
+        now = time.monotonic()
+        if sev == "ok":
+            self.bad_since.pop(name, None)
+            return "ok"
+        since = self.bad_since.setdefault(name, now)
+        if now - since >= self.conf["persist_s"]:
+            return sev
+        return "ok"  # still within grace window; don't escalate yet
+
+    def evaluate(self, tpv, sky):
+        raw = {
+            "position": self.check_position(tpv),
+            "time": self.check_time(tpv),
+            "velocity": self.check_velocity(tpv),
+            "cn0": self.check_cn0(sky),
+            "jamming": self.check_jamming(tpv, sky),
+            "constellations": self.check_constellations(sky),
+        }
+        checks = {}
+        worst = "ok"
+        for name, (sev, detail, extra) in raw.items():
+            eff = self.apply_persistence(name, sev)
+            checks[name] = {"status": eff, "detail": detail, **extra}
+            if self.SEV_RANK[eff] > self.SEV_RANK[worst]:
+                worst = eff
+        if self.ref is None:
+            worst = "init"
+        return checks, worst
+
+    def write_status(self, checks, overall, tpv):
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        doc = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "overall": overall,
+            "reference_mode": self.ref_mode,
+            "reference": self.ref,
+            "fix_mode": tpv.get("mode", 0),
+            "uptime_s": int(time.monotonic() - self.start),
+            "checks": checks,
+        }
+        tmp = STATUS_PATH + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, "w") as f:
+            json.dump(doc, f)
+        os.replace(tmp, STATUS_PATH)
+        if overall != self.overall:
+            log(f"{overall.upper()} overall integrity -> {overall} "
+                + "; ".join(f"{k}={v['status']}:{v['detail']}"
+                            for k, v in checks.items() if v["status"] != "ok") )
+            self.overall = overall
+
+    def run(self):
+        stream = GpsdStream(self.conf["gpsd_host"], self.conf["gpsd_port"])
+        tpv = {}
+        sky_acc = {}      # richest SKY collected since the last tick
+        sky_last = {}     # fallback if a tick window saw no SKY
+        last_tick = 0.0
+        for msg in stream.messages():
+            cls = msg.get("class")
+            if cls == "TPV":
+                tpv = msg
+                epoch = self.parse_gps_epoch(msg.get("time"))
+                if epoch is not None:
+                    self.last_time_delta = time.time() - epoch   # fresh, low-latency sample
+                if self.ref is None:
+                    self.survey_in(msg)
+            elif cls == "SKY" and msg.get("satellites"):
+                # gpsd emits several partial SKYs per cycle; keep the richest one
+                # within this 1 s window so the satellite list is complete.
+                if len(msg["satellites"]) >= len(sky_acc.get("satellites") or []):
+                    sky_acc = msg
+            now = time.monotonic()
+            if now - last_tick >= 1.0:
+                last_tick = now
+                sky = sky_acc if sky_acc.get("satellites") else sky_last
+                checks, overall = self.evaluate(tpv, sky)
+                self.write_status(checks, overall, tpv)
+                sky_last = sky
+                sky_acc = {}   # fresh window — lets the sky shrink if sats drop
+
+
+def main():
+    conf = load_conf()
+    log(f"INFO gps-integrity starting (stationary={conf['stationary']})")
+    Monitor(conf).run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:  # never die silently under systemd
+        log(f"FATAL {e}")
+        sys.exit(1)

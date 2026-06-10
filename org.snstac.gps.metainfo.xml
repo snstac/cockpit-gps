@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="addon">
+  <id>org.snstac.gps</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LGPL-2.1-or-later</project_license>
+  <name>GPS</name>
+  <summary>Live GNSS position, satellites, and spoof/jam integrity from gpsd</summary>
+  <description>
+    <p>
+      A Cockpit page showing live GNSS data from gpsd: position, motion, fix
+      quality, and a per-satellite signal table, plus an optional spoof/jam
+      integrity monitor for fixed installations.
+    </p>
+  </description>
+  <extends>org.cockpit_project.cockpit</extends>
+  <launchable type="cockpit-manifest">gps</launchable>
+  <url type="homepage">https://github.com/snstac/cockpit-gps</url>
+  <url type="bugtracker">https://github.com/snstac/cockpit-gps/issues</url>
+  <developer id="com.snstac">
+    <name>Sensors &amp; Signals LLC</name>
+  </developer>
+</component>
