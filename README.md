@@ -56,14 +56,22 @@ sudo ./install.sh --with-integrity     # system-wide, with the monitor
 Then open `https://<host>:9090` and click **GPS** (reload an open Cockpit tab to
 pick up the new package).
 
-### Prebuilt (no build tools)
+### Packages (no build tools)
 
-Grab `cockpit-gps.tar.gz` from the
-[Releases](https://github.com/snstac/cockpit-gps/releases) page, then:
+Download the `.deb` or `.rpm` for the latest release from the
+[Releases](https://github.com/snstac/cockpit-gps/releases) page:
 
 ```sh
-tar xzf cockpit-gps.tar.gz && cd cockpit-gps
-sudo ./install.sh --with-integrity
+# Debian/Ubuntu
+sudo apt install ./cockpit-gps_*_all.deb
+# Fedora/RHEL
+sudo dnf install ./cockpit-gps-*.noarch.rpm
+```
+
+The integrity monitor is included but not enabled by default:
+
+```sh
+sudo systemctl enable --now gps-integrity.service
 ```
 
 ### Development
