@@ -12,9 +12,17 @@ plus an optional **GPS spoof/jam integrity monitor**.
 - **Stable readings.** gpsd emits several partial reports per second for chatty
   receivers; the UI coalesces them and updates once per second so values don't
   flip‑flop.
+- **Receiver card** identifies the connected device — legacy NMEA, u-blox NMEA,
+  or **u-blox UBX native** (ZED-F9P and friends) — with model, firmware, and
+  capability badges.
 - **Integrity card** (when the monitor is installed): an overall spoof/jam
   verdict plus per-check status — position‑vs‑reference, time‑vs‑NTP, velocity,
-  C/N₀ profile, signal/jamming, and constellation health.
+  C/N₀ profile, signal/jamming, constellation health, and (on UBX receivers)
+  native **MON-RF** jamming telemetry.
+- **RF monitor card** (u-blox UBX only): per-band jamming state, jamInd, and
+  AGC from `UBX-MON-RF`, polled read-only through gpsd.
+- **Backwards compatible** with any gpsd-backed receiver; legacy NMEA units get
+  the full heuristic integrity suite with no UBX dependencies.
 
 Built from the Cockpit
 [starter-kit](https://github.com/cockpit-project/starter-kit)
@@ -100,6 +108,12 @@ spoofing/jamming with heuristics suited to a **fixed installation**:
 | C/N₀ uniformity | ◐ | uniform‑high signals (spoof signature) |
 | C/N₀ collapse + sat loss | ◐ | broadband jamming |
 | Constellation drop | ◐ | GPS‑L1‑only spoofer |
+| RF jamming (MON-RF) | ✅ | u-blox only — per-band jamInd + jammingState |
+
+On **u-blox ZED-F9P** receivers with bidirectional UBX enabled, the monitor
+auto-detects `driver=u-blox` + `native=1` from gpsd and polls `UBX-MON-RF`
+read-only via `ubxtool` (no serial port contention). Legacy NMEA receivers
+continue to use heuristic checks only.
 
 It survey-ins a reference position on first run
 (`/var/lib/gps-integrity/reference.json`), writes
@@ -115,11 +129,15 @@ Tuning is optional — copy `/etc/gps-integrity.conf.example` to
 mobile install, or pin `ref_lat`/`ref_lon`/`ref_alt` to skip the survey.
 
 **Limitations.** The strong detectors are position‑vs‑reference and
-time‑vs‑NTP — both independent of the GNSS RF. The C/N₀/jamming checks are
-proxies for the receiver's AGC data, which on a u-blox is only exposed over UBX
-(`UBX-NAV-STATUS`, `UBX-SEC-SIG`, `UBX-MON-RF`); if your receiver speaks UBX to
-gpsd, those are the authoritative source. Matched-power "meaconing" that holds
-position and time can defeat heuristic detection.
+time‑vs‑NTP — both independent of the GNSS RF. On u-blox UBX receivers,
+`UBX-MON-RF` jamming state is authoritative; heuristic C/N₀ checks remain as
+a supplementary layer. Matched-power "meaconing" that holds position and time
+can defeat all software-only detection.
+
+**Field deployment.** Install `gpsd-tools` (provides `ubxtool`) on nodes with
+ZED-F9P hardware. Configure the receiver with `zed-f9p-setup` (or equivalent)
+so gpsd reports `driver=u-blox` and `native=1`. Set `stationary: false` in
+`/etc/gps-integrity.conf` for mobile platforms.
 
 #
 

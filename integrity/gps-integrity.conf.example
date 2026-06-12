@@ -21,6 +21,12 @@
   "cn0_drop_db": 10.0,
   "min_sats": 4,
 
+  "_ubx_note": "u-blox ZED-F9P (and other UBX-native receivers) auto-enable MON-RF polling when gpsd reports driver=u-blox and native=1. Legacy NMEA receivers ignore these keys.",
+  "ubx_poll_enable": true,
+  "ubx_poll_interval_s": 5.0,
+  "ubx_jam_warn_ind": 15,
+  "ubx_jam_crit_ind": 30,
+
   "_reference_note": "Leave ref_lat/ref_lon/ref_alt null to auto survey-in. Set them to pin a known surveyed position and skip the survey.",
   "ref_lat": null,
   "ref_lon": null,

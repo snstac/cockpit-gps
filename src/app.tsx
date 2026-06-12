@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Cockpit GPS — live GNSS readout sourced from gpsd via `gpspipe -w`.
+ * Supports legacy NMEA receivers and u-blox ZED-F9P (UBX native) alike.
  */
 
 import React, { useEffect, useRef, useState } from 'react';
@@ -11,38 +12,55 @@ import { DescriptionList, DescriptionListGroup, DescriptionListTerm, Description
 import { Gallery } from "@patternfly/react-core/dist/esm/layouts/Gallery/index.js";
 import { Label } from "@patternfly/react-core/dist/esm/components/Label/index.js";
 import { Flex, FlexItem } from "@patternfly/react-core/dist/esm/layouts/Flex/index.js";
+import { Progress, ProgressSize } from "@patternfly/react-core/dist/esm/components/Progress/index.js";
 
 import cockpit from 'cockpit';
 
 const _ = cockpit.gettext;
 
-/* ---- gpsd JSON shapes (subset of the GPSD JSON protocol we care about) ---- */
+/* ---- gpsd JSON shapes ---- */
+
+interface Device {
+    class?: "DEVICE";
+    path?: string;
+    driver?: string;
+    native?: number;
+    readonly?: string | boolean;
+    bps?: number;
+    activated?: string;
+}
 
 interface Tpv {
     class: "TPV";
-    mode?: number;          // 0=unknown 1=no fix 2=2D 3=3D
+    mode?: number;
     lat?: number;
     lon?: number;
     altMSL?: number;
     altHAE?: number;
     alt?: number;
-    speed?: number;         // m/s
-    track?: number;         // degrees true
-    climb?: number;         // m/s
-    time?: string;          // ISO 8601 UTC
-    epx?: number;           // longitude error, metres
-    epy?: number;           // latitude error, metres
-    epv?: number;           // altitude error, metres
+    speed?: number;
+    track?: number;
+    climb?: number;
+    time?: string;
+    epx?: number;
+    epy?: number;
+    epv?: number;
+    eph?: number;          // u-blox horizontal error (m)
+    sep?: number;          // u-blox speed error (m/s)
+    leapseconds?: number;
 }
 
 interface Sat {
     PRN?: number;
     gnssid?: number;
     svid?: number;
+    sigid?: number;
     used?: boolean;
-    el?: number;            // elevation, degrees
-    az?: number;            // azimuth, degrees
-    ss?: number;            // signal strength, dB-Hz
+    el?: number;
+    az?: number;
+    ss?: number;
+    qual?: number;         // u-blox signal quality indicator
+    health?: number;
 }
 
 interface Sky {
@@ -51,38 +69,71 @@ interface Sky {
     hdop?: number;
     vdop?: number;
     pdop?: number;
-    uSat?: number;          // satellites used
-    nSat?: number;          // satellites seen
+    tdop?: number;
+    uSat?: number;
+    nSat?: number;
 }
 
 interface GpsdState {
     tpv: Tpv | null;
     sky: Sky | null;
+    device: Device | null;
     error: string | null;
     running: boolean;
 }
 
-/* ---- streaming hook: keep `gpspipe -w` running and parse its NDJSON ---- */
+interface IntegrityCheck {
+    status: string;
+    detail: string;
+    source?: string;
+}
+
+interface RfBlock {
+    block_id: number;
+    band: string;
+    noise_per_ms: number;
+    agc_cnt: number;
+    jam_ind: number;
+    jamming_state: string;
+    ant_status: string;
+}
+
+interface ReceiverInfo {
+    tier: string;
+    driver?: string;
+    native?: boolean;
+    path?: string;
+    bps?: number;
+    model?: string;
+    firmware?: string;
+    capabilities?: string[];
+}
+
+interface IntegrityStatus {
+    ts: string;
+    overall: string;
+    reference_mode: string;
+    fix_mode: number;
+    uptime_s: number;
+    receiver?: ReceiverInfo;
+    rf?: { blocks: RfBlock[], ts: string };
+    precision?: { eph_m?: number, sep_m?: number, epv_m?: number };
+    checks: Record<string, IntegrityCheck>;
+}
+
+/* ---- streaming hook ---- */
 
 function useGpsd(): GpsdState {
     const [tpv, setTpv] = useState<Tpv | null>(null);
     const [sky, setSky] = useState<Sky | null>(null);
+    const [device, setDevice] = useState<Device | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [running, setRunning] = useState(false);
-    // Most-complete SKY seen since the last UI flush. gpsd streams several
-    // partial SKY reports per cycle (a satellite-less summary, then a list that
-    // builds up incrementally), so we coalesce to the richest one and push it
-    // to the UI on a fixed cadence — otherwise the satellite count flip-flops.
     const bestSky = useRef<Sky | null>(null);
-    // Likewise for TPV: this receiver spreads its fix across RMC/GGA/GSA/GLL, so
-    // gpsd emits several TPVs per second — the first bare (no altitude/error),
-    // the last complete. Keep the most-complete one to stop altitude and the
-    // error estimate from blinking on and off.
     const bestTpv = useRef<Tpv | null>(null);
 
     useEffect(() => {
         let buffer = "";
-        // gpspipe connects to gpsd on localhost:2947 and emits one JSON object per line.
         const proc = cockpit.spawn(["gpspipe", "-w"], { err: "message" });
         setRunning(true);
         setError(null);
@@ -102,17 +153,20 @@ function useGpsd(): GpsdState {
                     continue;
                 }
                 if (obj.class === "TPV") {
-                    // Keep the most-complete TPV this interval (see bestTpv note).
                     const t = obj as unknown as Tpv;
                     if (tpvScore(t) >= tpvScore(bestTpv.current))
                         bestTpv.current = t;
                 } else if (obj.class === "SKY") {
-                    // Keep only the richest satellite list this interval; ignore
-                    // the satellite-less summary reports that would zero it out.
                     const s = obj as unknown as Sky;
                     const len = s.satellites?.length ?? 0;
                     if (len > 0 && len >= (bestSky.current?.satellites?.length ?? 0))
                         bestSky.current = s;
+                } else if (obj.class === "DEVICE") {
+                    setDevice(obj as unknown as Device);
+                } else if (obj.class === "DEVICES") {
+                    const devices = (obj as { devices?: Device[] }).devices;
+                    if (devices?.[0])
+                        setDevice(devices[0]);
                 } else if (obj.class === "ERROR") {
                     setError(String(obj.message ?? _("gpsd reported an error")));
                 }
@@ -125,8 +179,6 @@ function useGpsd(): GpsdState {
                     setRunning(false);
                 });
 
-        // Push the coalesced TPV/SKY to the UI once a second; reset afterwards
-        // so values dropping out (a constellation, a lost fix) are reflected.
         const flush = window.setInterval(() => {
             if (bestTpv.current) {
                 const t = bestTpv.current;
@@ -147,26 +199,9 @@ function useGpsd(): GpsdState {
         };
     }, []);
 
-    return { tpv, sky, error, running };
+    return { tpv, sky, device, error, running };
 }
 
-/* ---- integrity monitor (gps-integrity daemon) ---- */
-
-interface IntegrityCheck {
-    status: string;            // ok | warn | crit
-    detail: string;
-}
-
-interface IntegrityStatus {
-    ts: string;
-    overall: string;           // ok | warn | crit | init
-    reference_mode: string;    // surveying | surveyed | configured
-    fix_mode: number;
-    uptime_s: number;
-    checks: Record<string, IntegrityCheck>;
-}
-
-// Reads the daemon's status file and re-renders whenever it changes.
 function useIntegrity(): { status: IntegrityStatus | null, missing: boolean } {
     const [status, setStatus] = useState<IntegrityStatus | null>(null);
     const [missing, setMissing] = useState(false);
@@ -181,7 +216,7 @@ function useIntegrity(): { status: IntegrityStatus | null, missing: boolean } {
             try {
                 setStatus(JSON.parse(content));
                 setMissing(false);
-            } catch { /* daemon mid-write; keep last good */ }
+            } catch { /* daemon mid-write */ }
         });
         return () => file.close();
     }, []);
@@ -189,12 +224,24 @@ function useIntegrity(): { status: IntegrityStatus | null, missing: boolean } {
     return { status, missing };
 }
 
-/* ---- formatting helpers ---- */
+/* ---- helpers ---- */
 
 const MODE_LABELS: Record<number, string> = { 0: _("Unknown"), 1: _("No fix"), 2: _("2D fix"), 3: _("3D fix") };
 
 const GNSS_NAMES: Record<number, string> = {
     0: "GPS", 1: "SBAS", 2: "Galileo", 3: "BeiDou", 4: "IMES", 5: "QZSS", 6: "GLONASS", 7: "NavIC",
+};
+
+const TIER_LABELS: Record<string, string> = {
+    ubx: _("u-blox UBX"),
+    enhanced: _("u-blox NMEA"),
+    legacy: _("NMEA"),
+    unknown: _("Unknown"),
+};
+
+const QUAL_LABELS: Record<number, string> = {
+    0: "—", 1: _("search"), 2: _("acquired"), 3: _("unusable"),
+    4: _("code"), 5: _("code+carrier"), 6: _("code+carrier"), 7: _("locked"),
 };
 
 function fmtNum(v: number | undefined, digits: number, unit = ""): string {
@@ -226,30 +273,49 @@ function altitude(tpv: Tpv | null): number | undefined {
     return tpv.altMSL ?? tpv.alt ?? tpv.altHAE;
 }
 
-// Count of populated optional fields, used to pick the most-complete TPV of an
-// epoch — gpsd emits several per second, sparsest (RMC-only) first.
 function tpvScore(t: Tpv | null): number {
     if (!t)
         return -1;
     let n = 0;
-    for (const v of [t.altMSL ?? t.alt, t.epx, t.epy, t.epv, t.climb, t.track])
+    for (const v of [t.altMSL ?? t.alt, t.epx, t.epy, t.epv, t.eph, t.climb, t.track])
         if (v !== undefined && v !== null)
             n++;
     return n;
 }
 
-// Satellites used in the navigation solution.
 function usedCount(sky: Sky): number {
     return sky.uSat ?? (sky.satellites?.filter(s => s.used).length ?? 0);
 }
 
-// Satellites actually being received (non-zero SNR), excluding zero-signal
-// almanac entries that pad gpsd's nSat.
 function trackedCount(sky: Sky): number {
     return sky.satellites?.filter(s => (s.ss ?? 0) > 0).length ?? 0;
 }
 
-/* ---- small presentational helpers ---- */
+function hasNativeUbx(device: Device | null): boolean {
+    return device?.driver === "u-blox" && !!device?.native;
+}
+
+function horizontalError(tpv: Tpv | null): string {
+    if (!tpv)
+        return "—";
+    if (tpv.eph !== undefined)
+        return `± ${fmtNum(tpv.eph, 2, " m")}`;
+    if (tpv.epx !== undefined || tpv.epy !== undefined)
+        return `± ${fmtNum(Math.max(tpv.epx ?? 0, tpv.epy ?? 0), 1, " m")}`;
+    return "—";
+}
+
+function receiverTier(device: Device | null): string {
+    if (!device?.driver)
+        return "unknown";
+    if (device.driver === "u-blox" && device.native)
+        return "ubx";
+    if (device.driver === "u-blox")
+        return "enhanced";
+    return "legacy";
+}
+
+/* ---- presentational ---- */
 
 const Row = ({ term, children }: { term: string, children: React.ReactNode }) => (
     <DescriptionListGroup>
@@ -264,7 +330,39 @@ const FixLabel = ({ mode }: { mode?: number }) => {
     return <Label color={color as "green" | "orange" | "red"}>{MODE_LABELS[m] ?? MODE_LABELS[0]}</Label>;
 };
 
-/* ---- cards ---- */
+const ReceiverCard = ({ device, integrity }: { device: Device | null, integrity: IntegrityStatus | null }) => {
+    const rx = integrity?.receiver;
+    const tier = rx?.tier ?? receiverTier(device);
+    const tierColor = tier === "ubx" ? "blue" : tier === "enhanced" ? "teal" : "grey";
+    return (
+        <Card>
+            <CardTitle>{_("Receiver")}</CardTitle>
+            <CardBody>
+                <DescriptionList isHorizontal>
+                    <Row term={_("Type")}>
+                        <Label color={tierColor as "blue" | "teal" | "grey"}>{TIER_LABELS[tier] ?? tier}</Label>
+                        {rx?.model && <span className="gps-sub" style={{ marginInlineStart: "8px" }}>{rx.model}</span>}
+                    </Row>
+                    <Row term={_("Driver")}>{device?.driver ?? rx?.driver ?? "—"}</Row>
+                    {rx?.firmware && <Row term={_("Firmware")}>{rx.firmware}</Row>}
+                    <Row term={_("Port")}>
+                        <span className="gps-mono">{device?.path ?? rx?.path ?? "—"}</span>
+                    </Row>
+                    {(device?.bps ?? rx?.bps) && <Row term={_("Baud")}>{device?.bps ?? rx?.bps}</Row>}
+                    {rx?.capabilities && rx.capabilities.length > 0 && (
+                        <Row term={_("Capabilities")}>
+                            <div className="gps-cap-badges">
+                                {rx.capabilities.map(c => (
+                                    <Label key={c} isCompact color="blue">{c}</Label>
+                                ))}
+                            </div>
+                        </Row>
+                    )}
+                </DescriptionList>
+            </CardBody>
+        </Card>
+    );
+};
 
 const PositionCard = ({ tpv }: { tpv: Tpv | null }) => {
     const hasFix = (tpv?.mode ?? 0) >= 2 && tpv?.lat !== undefined && tpv?.lon !== undefined;
@@ -284,11 +382,7 @@ const PositionCard = ({ tpv }: { tpv: Tpv | null }) => {
                             ? <>{fmtNum(altitude(tpv), 1, " m")}<span className="gps-sub"> ({fmtNum(altitude(tpv)! * 3.28084, 0, " ft")})</span></>
                             : "—"}
                     </Row>
-                    <Row term={_("Est. error")}>
-                        {tpv?.epx !== undefined || tpv?.epy !== undefined
-                            ? `± ${fmtNum(Math.max(tpv?.epx ?? 0, tpv?.epy ?? 0), 1, " m")}`
-                            : "—"}
-                    </Row>
+                    <Row term={_("Est. error")}>{horizontalError(tpv)}</Row>
                 </DescriptionList>
             </CardBody>
         </Card>
@@ -311,6 +405,7 @@ const MotionCard = ({ tpv }: { tpv: Tpv | null }) => {
                         {tpv?.track !== undefined ? `${fmtNum(tpv.track, 0, "°")} ${cardinal(tpv.track)}` : "—"}
                     </Row>
                     <Row term={_("Climb")}>{fmtNum(tpv?.climb, 2, " m/s")}</Row>
+                    {tpv?.sep !== undefined && <Row term={_("Speed error")}>{fmtNum(tpv.sep, 2, " m/s")}</Row>}
                 </DescriptionList>
             </CardBody>
         </Card>
@@ -330,6 +425,10 @@ const QualityCard = ({ tpv, sky }: { tpv: Tpv | null, sky: Sky | null }) => {
                     </Row>
                     <Row term="HDOP">{fmtNum(sky?.hdop, 2)}</Row>
                     <Row term="VDOP">{fmtNum(sky?.vdop, 2)}</Row>
+                    {sky?.pdop !== undefined && <Row term="PDOP">{fmtNum(sky.pdop, 2)}</Row>}
+                    {tpv?.eph !== undefined && <Row term={_("H. precision")}>{fmtNum(tpv.eph, 2, " m")}</Row>}
+                    {tpv?.epv !== undefined && <Row term={_("V. precision")}>{fmtNum(tpv.epv, 2, " m")}</Row>}
+                    {tpv?.leapseconds !== undefined && <Row term={_("Leap sec")}>{tpv.leapseconds}</Row>}
                     <Row term={_("UTC time")}>{time ? time.toISOString().replace(".000", "") : "—"}</Row>
                 </DescriptionList>
             </CardBody>
@@ -337,9 +436,47 @@ const QualityCard = ({ tpv, sky }: { tpv: Tpv | null, sky: Sky | null }) => {
     );
 };
 
-const SatelliteCard = ({ sky }: { sky: Sky | null }) => {
-    // Show only satellites being tracked (have signal) or used in the fix; the
-    // full list includes dozens of zero-signal almanac entries.
+const RfMonitorCard = ({ rf }: { rf: IntegrityStatus["rf"] }) => {
+    if (!rf?.blocks?.length)
+        return null;
+    const jamColor = (state: string) => state === "OK" ? "green" : state === "Warning" ? "orange" : "red";
+    return (
+        <Card>
+            <CardTitle>{_("RF monitor (u-blox MON-RF)")}</CardTitle>
+            <CardBody>
+                <table className="gps-rf-table">
+                    <thead>
+                        <tr>
+                            <th>{_("Band")}</th>
+                            <th>{_("Jamming")}</th>
+                            <th>{_("jamInd")}</th>
+                            <th>{_("AGC")}</th>
+                            <th>{_("Antenna")}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rf.blocks.map(b => (
+                            <tr key={b.block_id}>
+                                <td>{b.band}</td>
+                                <td><Label isCompact color={jamColor(b.jamming_state) as "green" | "orange" | "red"}>{b.jamming_state}</Label></td>
+                                <td>
+                                    <Progress value={b.jam_ind} title={String(b.jam_ind)} size={ProgressSize.sm} />
+                                </td>
+                                <td>{b.agc_cnt}</td>
+                                <td>{b.ant_status}</td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+                <div className="gps-sub" style={{ marginBlockStart: "8px" }}>
+                    {cockpit.format(_("Updated $0"), rf.ts ?? "—")}
+                </div>
+            </CardBody>
+        </Card>
+    );
+};
+
+const SatelliteCard = ({ sky, native }: { sky: Sky | null, native: boolean }) => {
     const sats = (sky?.satellites ?? [])
             .filter(s => (s.ss ?? 0) > 0 || s.used)
             .sort((a, b) => (b.ss ?? -1) - (a.ss ?? -1));
@@ -358,6 +495,7 @@ const SatelliteCard = ({ sky }: { sky: Sky | null }) => {
                                     <th>{_("Used")}</th>
                                     <th>{_("Elev")}</th>
                                     <th>{_("Azim")}</th>
+                                    {native && <th>{_("Qual")}</th>}
                                     <th>{_("SNR (dB-Hz)")}</th>
                                 </tr>
                             </thead>
@@ -369,6 +507,7 @@ const SatelliteCard = ({ sky }: { sky: Sky | null }) => {
                                         <td>{s.used ? "✓" : ""}</td>
                                         <td>{fmtNum(s.el, 0, "°")}</td>
                                         <td>{fmtNum(s.az, 0, "°")}</td>
+                                        {native && <td className="gps-sub">{s.qual !== undefined ? (QUAL_LABELS[s.qual] ?? s.qual) : "—"}</td>}
                                         <td>
                                             <div className="gps-snr">
                                                 <span className="gps-snr-bar" style={{ width: `${Math.min(100, (s.ss ?? 0) * 2)}%` }} />
@@ -385,8 +524,6 @@ const SatelliteCard = ({ sky }: { sky: Sky | null }) => {
     );
 };
 
-/* ---- integrity (spoof/jam) card ---- */
-
 const SEV: Record<string, { color: "green" | "orange" | "red" | "blue", label: string }> = {
     ok: { color: "green", label: _("OK") },
     warn: { color: "orange", label: _("Warning") },
@@ -399,7 +536,8 @@ const CHECK_LABELS: Record<string, string> = {
     time: _("Time vs NTP"),
     velocity: _("Velocity"),
     cn0: _("C/N₀ profile"),
-    jamming: _("Signal / jamming"),
+    jamming: _("Signal / jamming (heuristic)"),
+    rf_jamming: _("RF jamming (MON-RF)"),
     constellations: _("Constellations"),
 };
 
@@ -414,11 +552,18 @@ const IntegrityCard = ({ status, missing }: { status: IntegrityStatus | null, mi
     else if (status) {
         const o = status.overall;
         const title = o === "ok" ? _("No spoofing or jamming indicators")
-            : o === "init" ? cockpit.format(_("Surveying reference position…"))
+            : o === "init" ? _("Surveying reference position…")
                 : o === "warn" ? _("Integrity warning — see checks below")
                     : _("Integrity ALERT — possible spoofing or jamming");
         banner = <Alert variant={OVERALL_VARIANT[o] ?? "info"} isInline isPlain title={title} />;
     }
+
+    const checks = status?.checks ?? {};
+    const order = ["rf_jamming", "position", "time", "velocity", "cn0", "jamming", "constellations"];
+    const sorted = Object.entries(checks).sort(([a], [b]) => {
+        const ia = order.indexOf(a); const ib = order.indexOf(b);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
 
     return (
         <Card>
@@ -428,7 +573,7 @@ const IntegrityCard = ({ status, missing }: { status: IntegrityStatus | null, mi
                 {status && (
                     <table className="gps-integrity-table">
                         <tbody>
-                            {Object.entries(status.checks).map(([key, c]) => (
+                            {sorted.map(([key, c]) => (
                                 <tr key={key}>
                                     <td>{CHECK_LABELS[key] ?? key}</td>
                                     <td><Label isCompact color={(SEV[c.status] ?? SEV.init).color}>{(SEV[c.status] ?? SEV.init).label}</Label></td>
@@ -450,21 +595,26 @@ const IntegrityCard = ({ status, missing }: { status: IntegrityStatus | null, mi
     );
 };
 
-/* ---- top-level status banner ---- */
-
 const StatusBanner = ({ state }: { state: GpsdState }) => {
     if (state.error)
         return <Alert variant="danger" isInline title={_("GPS error")}>{state.error}</Alert>;
     if (!state.tpv && !state.sky)
         return <Alert variant="info" isInline title={_("Connecting to gpsd…")} />;
     const mode = state.tpv?.mode ?? 0;
+    const tier = receiverTier(state.device);
+    const tierNote = tier === "ubx" ? _(" · ZED-F9P UBX") : tier === "legacy" ? "" : _(" · u-blox");
     if (mode < 2)
         return <Alert variant="warning" isInline title={_("Acquiring satellites — no position fix yet")} />;
+    const prec = state.tpv?.eph !== undefined ? cockpit.format(_(", ±$0 m"), fmtNum(state.tpv.eph, 2)) : "";
     return (
         <Alert
             variant="success"
             isInline
-            title={cockpit.format(_("$0 — $1 satellites in use"), MODE_LABELS[mode], state.sky ? usedCount(state.sky) : 0)}
+            title={cockpit.format(_("$0 — $1 satellites in use$2$3"),
+                MODE_LABELS[mode],
+                state.sky ? usedCount(state.sky) : 0,
+                prec,
+                tierNote)}
         />
     );
 };
@@ -472,6 +622,7 @@ const StatusBanner = ({ state }: { state: GpsdState }) => {
 export const Application = () => {
     const state = useGpsd();
     const integrity = useIntegrity();
+    const native = hasNativeUbx(state.device);
 
     return (
         <div className="gps-page">
@@ -480,7 +631,8 @@ export const Application = () => {
                     <StatusBanner state={state} />
                 </FlexItem>
                 <FlexItem>
-                    <Gallery hasGutter minWidths={{ default: "300px" }}>
+                    <Gallery hasGutter minWidths={{ default: "280px" }}>
+                        <ReceiverCard device={state.device} integrity={integrity.status} />
                         <PositionCard tpv={state.tpv} />
                         <MotionCard tpv={state.tpv} />
                         <QualityCard tpv={state.tpv} sky={state.sky} />
@@ -489,8 +641,13 @@ export const Application = () => {
                 <FlexItem>
                     <IntegrityCard status={integrity.status} missing={integrity.missing} />
                 </FlexItem>
+                {integrity.status?.rf && (
+                    <FlexItem>
+                        <RfMonitorCard rf={integrity.status.rf} />
+                    </FlexItem>
+                )}
                 <FlexItem>
-                    <SatelliteCard sky={state.sky} />
+                    <SatelliteCard sky={state.sky} native={native} />
                 </FlexItem>
             </Flex>
         </div>
