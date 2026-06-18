@@ -10,10 +10,30 @@ body,
     block-size: 100%;
 }
 
+body {
+    background: #eef1f0;
+}
+
 .gps-page {
     block-size: 100%;
     overflow-y: auto;
-    padding: var(--pf-t--global--spacer--lg, 1rem);
+    padding: clamp(0.75rem, 2vw, 1.5rem);
+    background:
+        linear-gradient(180deg, rgb(12 31 31 / 6%), rgb(12 31 31 / 0%)),
+        #eef1f0;
+}
+
+.pf-v6-c-card,
+.pf-c-card {
+    border: 1px solid rgb(21 48 47 / 18%);
+    border-radius: 8px;
+    box-shadow: 0 10px 28px rgb(14 29 31 / 8%);
+}
+
+.pf-v6-c-button,
+.pf-c-button,
+button {
+    border-radius: 5px;
 }
 
 // Muted secondary line under a primary value (e.g. DMS under decimal degrees).
@@ -43,6 +63,19 @@ body,
 
     .gps-sat-used td {
         font-weight: var(--pf-t--global--font--weight--body--bold, 700);
+    }
+}
+
+@media (width <= 760px) {
+    .gps-sat-table,
+    .gps-rf-table {
+        display: block;
+        overflow-x: auto;
+    }
+
+    .pf-v6-l-flex,
+    .pf-c-form__actions {
+        flex-wrap: wrap;
     }
 }
 
@@ -108,7 +141,7 @@ body,
         display: inline-block;
         block-size: 8px;
         min-inline-size: 2px;
-        background: var(--pf-t--global--color--brand--default, #0066cc);
+        background: var(--pf-t--global--color--brand--default, #06c);
         border-radius: 2px;
     }
 
