@@ -1,6 +1,17 @@
 {
+    "version": 0,
+    "require": {
+        "cockpit": "314"
+    },
     "requires": {
-        "cockpit": "320"
+        "cockpit": "314"
+    },
+
+    "tools": {
+        "index": {
+            "label": "GPS",
+            "path": "index.html"
+        }
     },
 
     "menu": {
