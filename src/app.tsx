@@ -40,6 +40,8 @@ interface Tpv {
     alt?: number;
     speed?: number;
     track?: number;
+    magtrack?: number;
+    magvar?: number;
     climb?: number;
     time?: string;
     epx?: number;
@@ -48,6 +50,13 @@ interface Tpv {
     eph?: number;          // u-blox horizontal error (m)
     sep?: number;          // u-blox speed error (m/s)
     leapseconds?: number;
+}
+
+interface Attitude {
+    class: "ATT" | "IMU";
+    heading?: number;
+    mheading?: number;
+    mag_st?: string;
 }
 
 interface Sat {
@@ -78,6 +87,7 @@ interface GpsdState {
     tpv: Tpv | null;
     sky: Sky | null;
     device: Device | null;
+    attitude: Attitude | null;
     error: string | null;
     running: boolean;
 }
@@ -127,10 +137,12 @@ function useGpsd(): GpsdState {
     const [tpv, setTpv] = useState<Tpv | null>(null);
     const [sky, setSky] = useState<Sky | null>(null);
     const [device, setDevice] = useState<Device | null>(null);
+    const [attitude, setAttitude] = useState<Attitude | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [running, setRunning] = useState(false);
     const bestSky = useRef<Sky | null>(null);
     const bestTpv = useRef<Tpv | null>(null);
+    const bestAttitude = useRef<Attitude | null>(null);
 
     useEffect(() => {
         let buffer = "";
@@ -156,6 +168,8 @@ function useGpsd(): GpsdState {
                     const t = obj as unknown as Tpv;
                     if (tpvScore(t) >= tpvScore(bestTpv.current))
                         bestTpv.current = t;
+                } else if (obj.class === "ATT" || obj.class === "IMU") {
+                    bestAttitude.current = obj as unknown as Attitude;
                 } else if (obj.class === "SKY") {
                     const s = obj as unknown as Sky;
                     const len = s.satellites?.length ?? 0;
@@ -189,6 +203,10 @@ function useGpsd(): GpsdState {
                 setSky(bestSky.current);
                 bestSky.current = null;
             }
+            if (bestAttitude.current) {
+                setAttitude(prev => ({ ...(prev ?? {}), ...bestAttitude.current! }));
+                bestAttitude.current = null;
+            }
         }, 1000);
 
         return () => {
@@ -199,7 +217,7 @@ function useGpsd(): GpsdState {
         };
     }, []);
 
-    return { tpv, sky, device, error, running };
+    return { tpv, sky, device, attitude, error, running };
 }
 
 function useIntegrity(): { status: IntegrityStatus | null, missing: boolean } {
@@ -267,6 +285,17 @@ function cardinal(track: number | undefined): string {
     return dirs[Math.round(track / 45) % 8];
 }
 
+function normalizeDegrees(value: number): number {
+    return ((value % 360) + 360) % 360;
+}
+
+function fmtBearing(value: number | undefined): string {
+    if (value === undefined || value === null || Number.isNaN(value))
+        return "—";
+    const bearing = normalizeDegrees(value);
+    return `${fmtNum(bearing, 0, "°")} ${cardinal(bearing)}`;
+}
+
 function altitude(tpv: Tpv | null): number | undefined {
     if (!tpv)
         return undefined;
@@ -277,10 +306,18 @@ function tpvScore(t: Tpv | null): number {
     if (!t)
         return -1;
     let n = 0;
-    for (const v of [t.altMSL ?? t.alt, t.epx, t.epy, t.epv, t.eph, t.climb, t.track])
+    for (const v of [t.altMSL ?? t.alt, t.epx, t.epy, t.epv, t.eph, t.climb, t.track, t.magvar])
         if (v !== undefined && v !== null)
             n++;
     return n;
+}
+
+function magneticCourse(tpv: Tpv | null): number | undefined {
+    if (tpv?.magtrack !== undefined)
+        return normalizeDegrees(tpv.magtrack);
+    if (tpv?.track === undefined || tpv.magvar === undefined)
+        return undefined;
+    return normalizeDegrees(tpv.track + tpv.magvar);
 }
 
 function usedCount(sky: Sky): number {
@@ -324,7 +361,7 @@ const Row = ({ term, children }: { term: string, children: React.ReactNode }) =>
     </DescriptionListGroup>
 );
 
-const FixLabel = ({ mode }: { mode?: number }) => {
+const FixLabel = ({ mode }: { mode?: number | undefined }) => {
     const m = mode ?? 0;
     const color = m >= 3 ? "green" : m === 2 ? "orange" : "red";
     return <Label color={color as "green" | "orange" | "red"}>{MODE_LABELS[m] ?? MODE_LABELS[0]}</Label>;
@@ -389,8 +426,10 @@ const PositionCard = ({ tpv }: { tpv: Tpv | null }) => {
     );
 };
 
-const MotionCard = ({ tpv }: { tpv: Tpv | null }) => {
+const MotionCard = ({ tpv, attitude }: { tpv: Tpv | null, attitude: Attitude | null }) => {
     const speed = tpv?.speed;
+    const magneticHeading = attitude?.mheading;
+    const derivedMagneticCourse = magneticCourse(tpv);
     return (
         <Card>
             <CardTitle>{_("Motion")}</CardTitle>
@@ -402,8 +441,28 @@ const MotionCard = ({ tpv }: { tpv: Tpv | null }) => {
                             : "—"}
                     </Row>
                     <Row term={_("Course")}>
-                        {tpv?.track !== undefined ? `${fmtNum(tpv.track, 0, "°")} ${cardinal(tpv.track)}` : "—"}
+                        {fmtBearing(tpv?.track)}
                     </Row>
+                    {(magneticHeading !== undefined || derivedMagneticCourse !== undefined) && (
+                        <Row term={_("Magnetic heading")}>
+                            {magneticHeading !== undefined
+                                ? (
+                                    <>
+                                        {fmtBearing(magneticHeading)}
+                                        {attitude?.mag_st && <span className="gps-sub"> ({attitude.mag_st})</span>}
+                                    </>
+                                )
+                                : (
+                                    <>
+                                        {fmtBearing(derivedMagneticCourse)}
+                                        <span className="gps-sub"> {_("derived from course")}</span>
+                                    </>
+                                )}
+                        </Row>
+                    )}
+                    {tpv?.magvar !== undefined && (
+                        <Row term={_("Mag. variation")}>{fmtNum(tpv.magvar, 1, "°")}</Row>
+                    )}
                     <Row term={_("Climb")}>{fmtNum(tpv?.climb, 2, " m/s")}</Row>
                     {tpv?.sep !== undefined && <Row term={_("Speed error")}>{fmtNum(tpv.sep, 2, " m/s")}</Row>}
                 </DescriptionList>
@@ -634,7 +693,7 @@ export const Application = () => {
                     <Gallery hasGutter minWidths={{ default: "280px" }}>
                         <ReceiverCard device={state.device} integrity={integrity.status} />
                         <PositionCard tpv={state.tpv} />
-                        <MotionCard tpv={state.tpv} />
+                        <MotionCard tpv={state.tpv} attitude={state.attitude} />
                         <QualityCard tpv={state.tpv} sky={state.sky} />
                     </Gallery>
                 </FlexItem>
